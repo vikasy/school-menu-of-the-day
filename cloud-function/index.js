@@ -145,10 +145,13 @@ async function fetchMenuItemsForUrl(menuUrl, todayKey, mealLabel) {
       end_date: formatDateString(year, oneBasedMonth, lastDayOfMonth)
     };
 
-    const graphResponse = await axios.post(GRAPHQL_ENDPOINT, null, {
-      params: {
-        query: MENU_GRAPHQL_QUERY,
-        variables: JSON.stringify(variables)
+    const graphResponse = await axios.post(GRAPHQL_ENDPOINT, {
+      query: MENU_GRAPHQL_QUERY,
+      variables
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
       },
       timeout: REQUEST_TIMEOUT_MS
     });
