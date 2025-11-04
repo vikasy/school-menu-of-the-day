@@ -1,0 +1,15 @@
+{
+  "name": "school-menu-cloud-function",
+  "version": "1.0.0",
+  "description": "Cloud Function for daily school menu notifications",
+  "main": "index.js",
+  "scripts": {
+    "start": "functions-framework --target=sendDailyMenu"
+  },
+  "dependencies": {
+    "@google-cloud/functions-framework": "^3.3.0",
+    "nodemailer": "^6.9.7",
+    "axios": "^1.6.2",
+    "cheerio": "^1.0.0-rc.12"
+  }
+}

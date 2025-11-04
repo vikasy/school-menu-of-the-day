@@ -1,0 +1,14 @@
+node_modules/
+cloud-function/node_modules/
+
+# Local environment / secrets
+.env
+cloud-function/.env.yaml
+
+# Logs and OS cruft
+*.log
+.DS_Store
+
+# Generated assets
+*.pdf
+data/
