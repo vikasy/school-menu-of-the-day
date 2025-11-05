@@ -2,10 +2,18 @@ const functions = require('@google-cloud/functions-framework');
 const nodemailer = require('nodemailer');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const admin = require('firebase-admin');
+const crypto = require('crypto');
 
 const GRAPHQL_ENDPOINT = 'https://api.isitesoftware.com/graphql';
 const MENU_CONTROLLER_OPEN_ENDPOINT = 'https://www.schoolnutritionandfitness.com/webmenus2/api/menuController.php/open';
 const REQUEST_TIMEOUT_MS = 15000;
+
+const SUBSCRIPTION_SECRET = process.env.SUBSCRIPTION_SECRET || '';
+const UNSUBSCRIBE_URL = process.env.UNSUBSCRIBE_URL || '';
+const SUBSCRIBE_PAGE = process.env.SUBSCRIBE_PAGE || '';
+
+let firestore = null;
 
 const MENU_GRAPHQL_QUERY = `query detailsCalendarAlphaPage($menu_type_id: String!, $start_date: String!, $end_date: String!) {
   menuType(id: $menu_type_id) {
@@ -44,6 +52,312 @@ function escapeHtml(input) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function initializeFirestore() {
+  if (!firestore) {
+    if (admin.apps.length === 0) {
+      admin.initializeApp();
+    }
+    firestore = admin.firestore();
+  }
+  return firestore;
+}
+
+function normalizeEmail(email) {
+  return email ? email.trim().toLowerCase() : '';
+}
+
+function validateEmail(email) {
+  if (!email) {
+    return false;
+  }
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function cleanRecipientsList(emails) {
+  const seen = new Set();
+  return emails
+    .map(normalizeEmail)
+    .filter(email => validateEmail(email) && !seen.has(email) && seen.add(email));
+}
+
+function extractFieldFromRequest(req, field) {
+  if (req.body) {
+    if (typeof req.body === 'string') {
+      try {
+        const params = new URLSearchParams(req.body);
+        const value = params.get(field);
+        if (value) {
+          return value;
+        }
+      } catch (error) {
+        // Ignore parsing errors
+      }
+    } else if (typeof req.body === 'object' && req.body[field]) {
+      return req.body[field];
+    }
+  }
+
+  if (req.query && req.query[field]) {
+    return req.query[field];
+  }
+
+  return null;
+}
+
+function extractEmailFromRequest(req) {
+  return extractFieldFromRequest(req, 'email');
+}
+
+async function upsertSubscriber(email, active, metadata = {}) {
+  const normalized = normalizeEmail(email);
+  if (!validateEmail(normalized)) {
+    throw new Error('Invalid email address');
+  }
+
+  const db = initializeFirestore();
+  const docRef = db.collection('subscribers').doc(normalized);
+  const snapshot = await docRef.get();
+  const timestamp = admin.firestore.FieldValue.serverTimestamp();
+
+  const data = {
+    email: normalized,
+    active,
+    updatedAt: timestamp,
+    ...metadata
+  };
+
+  if (!snapshot.exists) {
+    data.createdAt = timestamp;
+  }
+
+  await docRef.set(data, { merge: true });
+}
+
+async function getActiveSubscribers() {
+  try {
+    const db = initializeFirestore();
+    const snapshot = await db.collection('subscribers').where('active', '==', true).get();
+
+    if (snapshot.empty) {
+      const bootstrapList = cleanRecipientsList((process.env.RECIPIENT_EMAIL || '').split(','));
+      if (bootstrapList.length) {
+        await Promise.all(
+          bootstrapList.map(email => upsertSubscriber(email, true, { source: 'bootstrap' }))
+        );
+        return bootstrapList;
+      }
+      return [];
+    }
+
+    return snapshot.docs
+      .map(doc => {
+        const data = doc.data();
+        return normalizeEmail(data.email || doc.id);
+      })
+      .filter(validateEmail);
+  } catch (error) {
+    console.error('Error loading subscribers from Firestore:', error.message);
+    return cleanRecipientsList((process.env.RECIPIENT_EMAIL || '').split(','));
+  }
+}
+
+function createUnsubscribeToken(email) {
+  if (!SUBSCRIPTION_SECRET) {
+    return null;
+  }
+  return crypto
+    .createHmac('sha256', SUBSCRIPTION_SECRET)
+    .update(normalizeEmail(email))
+    .digest('hex');
+}
+
+function verifyUnsubscribeToken(email, token) {
+  if (!SUBSCRIPTION_SECRET) {
+    return false;
+  }
+  const expected = createUnsubscribeToken(email);
+  if (!expected || !token) {
+    return false;
+  }
+  try {
+    const expectedBuffer = Buffer.from(expected, 'hex');
+    const tokenBuffer = Buffer.from(token, 'hex');
+    if (expectedBuffer.length !== tokenBuffer.length) {
+      return false;
+    }
+    return crypto.timingSafeEqual(expectedBuffer, tokenBuffer);
+  } catch (error) {
+    return false;
+  }
+}
+
+function buildUnsubscribeLink(email) {
+  if (!UNSUBSCRIBE_URL || !SUBSCRIPTION_SECRET) {
+    return null;
+  }
+
+  try {
+    const url = new URL(UNSUBSCRIBE_URL);
+    url.searchParams.set('email', normalizeEmail(email));
+    url.searchParams.set('token', createUnsubscribeToken(email));
+    return url.toString();
+  } catch (error) {
+    console.error('Unable to build unsubscribe URL:', error.message);
+    return null;
+  }
+}
+
+function renderMenuList(items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return '<p>Menu not available</p>';
+  }
+  const listItems = items.map(item => `<li>${escapeHtml(item)}</li>`).join('');
+  return `<ul>${listItems}</ul>`;
+}
+
+function buildMenuEmailHtml(menu, unsubscribeUrl) {
+  const breakfastListHtml = renderMenuList(menu.breakfast);
+  const lunchListHtml = renderMenuList(menu.lunch);
+  const unsubscribeBlock = unsubscribeUrl
+    ? `<p style="margin-top: 12px;">
+         <a href="${unsubscribeUrl}">Unsubscribe</a>
+         ${SUBSCRIBE_PAGE ? `· <a href="${SUBSCRIBE_PAGE}">Subscribe</a>` : ''}
+       </p>`
+    : '<p style="margin-top: 12px;">Reply to this email to update your subscription.</p>';
+
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <style>
+        body {
+          font-family: Arial, sans-serif;
+          line-height: 1.6;
+          color: #333;
+          max-width: 600px;
+          margin: 0 auto;
+          padding: 20px;
+        }
+        h1 {
+          color: #04538A;
+          border-bottom: 3px solid #04538A;
+          padding-bottom: 10px;
+        }
+        h2 {
+          color: #0668B3;
+          margin-top: 25px;
+          margin-bottom: 15px;
+        }
+        .menu-section {
+          background: #f8f9fa;
+          padding: 20px;
+          border-radius: 8px;
+          margin: 15px 0;
+        }
+        .menu-button {
+          display: inline-block;
+          background: #04538A;
+          color: white !important;
+          padding: 12px 30px;
+          text-decoration: none;
+          border-radius: 5px;
+          font-weight: bold;
+          margin: 10px 5px;
+        }
+        .menu-button:hover {
+          background: #0668B3;
+        }
+        .main-link {
+          background: #28a745;
+          text-align: center;
+          padding: 20px;
+          border-radius: 8px;
+          margin: 25px 0;
+        }
+        .main-link a {
+          color: white !important;
+          text-decoration: none;
+          font-size: 18px;
+          font-weight: bold;
+        }
+        .date {
+          color: #666;
+          font-style: italic;
+          margin-bottom: 20px;
+        }
+        .note {
+          background: #fff3cd;
+          border: 1px solid #ffc107;
+          padding: 15px;
+          margin: 20px 0;
+          border-radius: 5px;
+        }
+        .footer {
+          margin-top: 30px;
+          padding-top: 20px;
+          border-top: 1px solid #ddd;
+          font-size: 12px;
+          color: #888;
+          text-align: center;
+        }
+        a {
+          color: #04538A;
+        }
+      </style>
+    </head>
+    <body>
+      <h1>🍽️ Today's School Menu</h1>
+      <p class="date">${escapeHtml(menu.date)}</p>
+
+      ${menu.note ? `<div class="note">📌 ${escapeHtml(menu.note)}</div>` : ''}
+
+      <div class="main-link">
+        <a href="https://cusdk8nutrition.com/index.php?sid=1805092039571289&page=menus">
+          🌐 View All Menus on School Website
+        </a>
+      </div>
+
+      <div class="menu-section">
+        <h2>🥞 Breakfast Menu</h2>
+        ${breakfastListHtml}
+        ${menu.breakfastUrl ?
+          `<a href="${escapeHtml(menu.breakfastUrl)}" class="menu-button">📋 View Breakfast Details</a>
+           <p style="font-size: 12px; color: #666; margin-top: 10px;">
+             Direct link: <a href="${escapeHtml(menu.breakfastUrl)}" style="word-break: break-all;">${escapeHtml(menu.breakfastUrl)}</a>
+           </p>` :
+          ''
+        }
+      </div>
+
+      <div class="menu-section">
+        <h2>🍕 Lunch Menu</h2>
+        ${lunchListHtml}
+        ${menu.lunchUrl ?
+          `<a href="${escapeHtml(menu.lunchUrl)}" class="menu-button">📋 View Lunch Details</a>
+           <p style="font-size: 12px; color: #666; margin-top: 10px;">
+             Direct link: <a href="${escapeHtml(menu.lunchUrl)}" style="word-break: break-all;">${escapeHtml(menu.lunchUrl)}</a>
+           </p>` :
+          ''
+        }
+      </div>
+
+      <div class="footer">
+        <p>This is an automated notification from School Menu Notifier</p>
+        <p>Menu source: <a href="https://cusdk8nutrition.com">CU School District Nutrition Services</a></p>
+        <p>Accessible menus: <a href="https://www.schoolnutritionandfitness.com/webmenus2/">schoolnutritionandfitness.com</a></p>
+        ${unsubscribeBlock}
+      </div>
+    </body>
+    </html>
+  `;
+}
+
+function applyCorsHeaders(res) {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
 }
 
 function parseMenuParams(menuUrl) {
@@ -349,153 +663,37 @@ async function fetchMenu() {
 /**
  * Formats and sends email to multiple recipients
  */
-async function sendMenuEmail(menu) {
-  // Support multiple recipients
-  const recipients = process.env.RECIPIENT_EMAIL.split(',').map(email => email.trim());
-  const renderMenuList = items => {
-    if (!Array.isArray(items) || items.length === 0) {
-      return '<p>Menu not available</p>';
+async function sendMenuEmail(menu, recipients) {
+  const normalizedRecipients = cleanRecipientsList(Array.isArray(recipients) ? recipients : []);
+
+  if (normalizedRecipients.length === 0) {
+    console.log('No recipients to email. Skipping send.');
+    return [];
+  }
+
+  const sentTo = [];
+
+  for (const recipient of normalizedRecipients) {
+    const unsubscribeLink = buildUnsubscribeLink(recipient);
+    const html = buildMenuEmailHtml(menu, unsubscribeLink);
+    const mailOptions = {
+      from: `"School Menu Notifier" <${process.env.GMAIL_USER}>`,
+      to: recipient,
+      subject: `Today's School Menu - ${menu.date}`,
+      html
+    };
+
+    try {
+      console.log('Sending email to:', recipient);
+      await transporter.sendMail(mailOptions);
+      sentTo.push(recipient);
+      console.log('Email sent successfully to:', recipient);
+    } catch (error) {
+      console.error(`Failed to send email to ${recipient}:`, error.message);
     }
-    const listItems = items.map(item => `<li>${escapeHtml(item)}</li>`).join('');
-    return `<ul>${listItems}</ul>`;
-  };
+  }
 
-  const breakfastListHtml = renderMenuList(menu.breakfast);
-  const lunchListHtml = renderMenuList(menu.lunch);
-  const html = `
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <style>
-        body {
-          font-family: Arial, sans-serif;
-          line-height: 1.6;
-          color: #333;
-          max-width: 600px;
-          margin: 0 auto;
-          padding: 20px;
-        }
-        h1 {
-          color: #04538A;
-          border-bottom: 3px solid #04538A;
-          padding-bottom: 10px;
-        }
-        h2 {
-          color: #0668B3;
-          margin-top: 25px;
-          margin-bottom: 15px;
-        }
-        .menu-section {
-          background: #f8f9fa;
-          padding: 20px;
-          border-radius: 8px;
-          margin: 15px 0;
-        }
-        .menu-button {
-          display: inline-block;
-          background: #04538A;
-          color: white !important;
-          padding: 12px 30px;
-          text-decoration: none;
-          border-radius: 5px;
-          font-weight: bold;
-          margin: 10px 5px;
-        }
-        .menu-button:hover {
-          background: #0668B3;
-        }
-        .main-link {
-          background: #28a745;
-          text-align: center;
-          padding: 20px;
-          border-radius: 8px;
-          margin: 25px 0;
-        }
-        .main-link a {
-          color: white !important;
-          text-decoration: none;
-          font-size: 18px;
-          font-weight: bold;
-        }
-        .date {
-          color: #666;
-          font-style: italic;
-          margin-bottom: 20px;
-        }
-        .note {
-          background: #fff3cd;
-          border: 1px solid #ffc107;
-          padding: 15px;
-          margin: 20px 0;
-          border-radius: 5px;
-        }
-        .footer {
-          margin-top: 30px;
-          padding-top: 20px;
-          border-top: 1px solid #ddd;
-          font-size: 12px;
-          color: #888;
-          text-align: center;
-        }
-        a {
-          color: #04538A;
-        }
-      </style>
-    </head>
-    <body>
-      <h1>🍽️ Today's School Menu</h1>
-      <p class="date">${escapeHtml(menu.date)}</p>
-
-      ${menu.note ? `<div class="note">📌 ${escapeHtml(menu.note)}</div>` : ''}
-
-      <div class="menu-section">
-        <h2>🥞 Breakfast Menu</h2>
-        ${breakfastListHtml}
-        ${menu.breakfastUrl ?
-          `<p style="font-size: 12px; color: #666; margin-top: 10px;">
-             Direct link: <a href="${escapeHtml(menu.breakfastUrl)}" style="word-break: break-all;">${escapeHtml(menu.breakfastUrl)}</a>
-           </p>` :
-          ''
-        }
-      </div>
-
-      <div class="menu-section">
-        <h2>🍕 Lunch Menu</h2>
-        ${lunchListHtml}
-        ${menu.lunchUrl ?
-          `<p style="font-size: 12px; color: #666; margin-top: 10px;">
-             Direct link: <a href="${escapeHtml(menu.lunchUrl)}" style="word-break: break-all;">${escapeHtml(menu.lunchUrl)}</a>
-           </p>` :
-          ''
-        }
-      </div>
-
-      <div class="main-link">
-        <a href="https://cusdk8nutrition.com/index.php?sid=1805092039571289&page=menus">
-          🌐 View All Menus on School Website
-        </a>
-      </div>
-
-      <div class="footer">
-        <p>This is an automated notification from School Menu Notifier</p>
-        <p>Menu source: <a href="https://cusdk8nutrition.com">CU School District Nutrition Services</a></p>
-        <p>Accessible menus: <a href="https://www.schoolnutritionandfitness.com/webmenus2/">schoolnutritionandfitness.com</a></p>
-      </div>
-    </body>
-    </html>
-  `;
-
-  const mailOptions = {
-    from: `"School Menu Notifier" <${process.env.GMAIL_USER}>`,
-    to: recipients.join(', '),
-    subject: `Today's School Menu - ${menu.date}`,
-    html: html
-  };
-
-  console.log('Sending email to:', recipients.join(', '));
-  const result = await transporter.sendMail(mailOptions);
-  console.log('Email sent successfully to all recipients!');
-  return result;
+  return sentTo;
 }
 
 /**
@@ -509,13 +707,15 @@ functions.http('sendDailyMenu', async (req, res) => {
     const menu = await fetchMenu();
     console.log('Menu fetched:', JSON.stringify(menu, null, 2));
 
-    // Send email
-    await sendMenuEmail(menu);
+    const recipients = await getActiveSubscribers();
+    console.log(`Active subscribers: ${recipients.length}`);
+    const sentTo = await sendMenuEmail(menu, recipients);
 
     res.status(200).json({
       success: true,
-      message: 'Menu email sent successfully',
-      menu: menu
+      message: sentTo.length ? 'Menu email sent successfully' : 'Menu email skipped (no recipients)',
+      menu,
+      recipients: sentTo
     });
   } catch (error) {
     console.error('Error in function:', error);
@@ -523,5 +723,82 @@ functions.http('sendDailyMenu', async (req, res) => {
       success: false,
       error: error.message
     });
+  }
+});
+
+functions.http('subscribe', async (req, res) => {
+  applyCorsHeaders(res);
+
+  if (req.method === 'OPTIONS') {
+    res.status(204).send('');
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    res.status(200).send('Send a POST request with JSON body {"email": "you@example.com"} to subscribe.');
+    return;
+  }
+
+  try {
+    const rawEmail = extractEmailFromRequest(req);
+    const email = normalizeEmail(rawEmail);
+
+    if (!validateEmail(email)) {
+      res.status(400).json({ success: false, message: 'Invalid email address.' });
+      return;
+    }
+
+    await upsertSubscriber(email, true, { source: 'self-service' });
+    console.log(`Subscribed: ${email}`);
+    res.status(200).json({ success: true, message: `Subscribed ${email}` });
+  } catch (error) {
+    console.error('Error handling subscribe:', error.message);
+    res.status(500).json({ success: false, message: 'Unable to subscribe at this time.' });
+  }
+});
+
+functions.http('unsubscribe', async (req, res) => {
+  applyCorsHeaders(res);
+
+  if (req.method === 'OPTIONS') {
+    res.status(204).send('');
+    return;
+  }
+
+  const rawEmail = extractEmailFromRequest(req);
+  const email = normalizeEmail(rawEmail);
+  const token = extractFieldFromRequest(req, 'token');
+
+  if (!validateEmail(email) || !token) {
+    const message = 'Use the unsubscribe link from your email to manage your subscription.';
+    if (req.method === 'GET') {
+      res.status(200).send(message);
+    } else {
+      res.status(400).send(message);
+    }
+    return;
+  }
+
+  if (!verifyUnsubscribeToken(email, token)) {
+    res.status(403).send('Invalid or expired unsubscribe link.');
+    return;
+  }
+
+  try {
+    await upsertSubscriber(email, false, {
+      source: 'unsubscribe-link',
+      unsubscribedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    console.log(`Unsubscribed: ${email}`);
+
+    const message = `You have been unsubscribed (${email}).`;
+    if (req.accepts('html')) {
+      res.status(200).send(`<html><body><p>${escapeHtml(message)}</p></body></html>`);
+    } else {
+      res.status(200).json({ success: true, message });
+    }
+  } catch (error) {
+    console.error('Error handling unsubscribe:', error.message);
+    res.status(500).send('Unable to update subscription at this time.');
   }
 });
