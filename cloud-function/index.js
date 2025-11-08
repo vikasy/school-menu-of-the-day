@@ -308,7 +308,19 @@ function buildMenuEmailHtml(menu, unsubscribeUrl) {
       </style>
     </head>
     <body>
-      <h1>🍽️ Today's School Menu</h1>
+      <div class="menu-section">
+        <h2>🥞 Breakfast Menu</h2>
+        ${breakfastListHtml}
+        <h2 style="margin-top: 20px;">🍕 Lunch Menu</h2>
+        ${lunchListHtml}
+        ${menu.lunchUrl ?
+          `<p style="font-size: 12px; color: #666; margin-top: 20px;">
+             Direct link: <a href="${escapeHtml(menu.lunchUrl)}" style="word-break: break-all;">${escapeHtml(menu.lunchUrl)}</a>
+           </p>` :
+          ''
+        }
+      </div>
+
       <p class="date">${escapeHtml(menu.date)}</p>
 
       ${menu.note ? `<div class="note">📌 ${escapeHtml(menu.note)}</div>` : ''}
@@ -317,30 +329,6 @@ function buildMenuEmailHtml(menu, unsubscribeUrl) {
         <a href="https://cusdk8nutrition.com/index.php?sid=1805092039571289&page=menus">
           🌐 View All Menus on School Website
         </a>
-      </div>
-
-      <div class="menu-section">
-        <h2>🥞 Breakfast Menu</h2>
-        ${breakfastListHtml}
-        ${menu.breakfastUrl ?
-          `<a href="${escapeHtml(menu.breakfastUrl)}" class="menu-button">📋 View Breakfast Details</a>
-           <p style="font-size: 12px; color: #666; margin-top: 10px;">
-             Direct link: <a href="${escapeHtml(menu.breakfastUrl)}" style="word-break: break-all;">${escapeHtml(menu.breakfastUrl)}</a>
-           </p>` :
-          ''
-        }
-      </div>
-
-      <div class="menu-section">
-        <h2>🍕 Lunch Menu</h2>
-        ${lunchListHtml}
-        ${menu.lunchUrl ?
-          `<a href="${escapeHtml(menu.lunchUrl)}" class="menu-button">📋 View Lunch Details</a>
-           <p style="font-size: 12px; color: #666; margin-top: 10px;">
-             Direct link: <a href="${escapeHtml(menu.lunchUrl)}" style="word-break: break-all;">${escapeHtml(menu.lunchUrl)}</a>
-           </p>` :
-          ''
-        }
       </div>
 
       <div class="footer">
@@ -735,7 +723,33 @@ functions.http('subscribe', async (req, res) => {
   }
 
   if (req.method !== 'POST') {
-    res.status(200).send('Send a POST request with JSON body {"email": "you@example.com"} to subscribe.');
+    res.status(200).send(`<!DOCTYPE html>
+      <html>
+      <head>
+        <title>Subscribe to School Menu Emails</title>
+        <style>
+          body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f5f5f5; }
+          .wrap { max-width: 420px; margin: 40px auto; background: #fff; padding: 30px; border-radius: 8px; box-shadow: 0 4px 18px rgba(0,0,0,0.08); }
+          h1 { margin-top: 0; color: #04538A; }
+          label { display: block; margin-bottom: 8px; font-weight: bold; }
+          input[type="email"] { width: 100%; padding: 12px; border: 1px solid #ccc; border-radius: 4px; margin-bottom: 16px; }
+          button { background: #04538A; color: #fff; border: none; padding: 12px 18px; border-radius: 4px; font-size: 16px; cursor: pointer; }
+          button:hover { background: #0668B3; }
+          .note { margin-top: 16px; color: #666; font-size: 13px; }
+        </style>
+      </head>
+      <body>
+        <div class="wrap">
+          <h1>Subscribe to the Daily Menu</h1>
+          <form method="post" action="/subscribe">
+            <label for="email">Email address</label>
+            <input id="email" name="email" type="email" placeholder="you@example.com" required />
+            <button type="submit">Subscribe</button>
+          </form>
+          <p class="note">If you received this link from someone else, add yourself here to get the daily school menu.</p>
+        </div>
+      </body>
+      </html>`);
     return;
   }
 
